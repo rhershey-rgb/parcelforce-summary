@@ -10,24 +10,20 @@ from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="PF Weekly Summary — Monday + Tuesday only (stepwise)")
+app = FastAPI(title="PF Weekly Summary — Mon+Tue with Total-row parsing")
 
 # -------------------- helpers --------------------
 
-DAY_SEQUENCE = ["Monday", "Tuesday"]  # add more later as we validate
-
 def page1_text(pdf_bytes: bytes) -> str:
-    """Extract page 1 text and normalize spacing so numbers parse reliably."""
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        p0 = pdf.pages[0]
-        txt = p0.extract_text(layout=True) or p0.extract_text() or ""
-    # flatten whitespace
+        txt = (pdf.pages[0].extract_text(layout=True)
+               or pdf.pages[0].extract_text()
+               or "")
+    # Normalize whitespace and collapse spaced-out numbers
     txt = txt.replace("\n", " ")
     txt = re.sub(r"[ \t]+", " ", txt)
-
-    # collapse spaces inside digit/decimal runs
-    txt = re.sub(r"(?<=\d)\s+(?=\d)", "", txt)           # 1 2 3 -> 123
-    txt = re.sub(r"(?<=\d)\s*\.\s*(?=\d)", ".", txt)     # 12 . 34 -> 12.34
+    txt = re.sub(r"(?<=\d)\s+(?=\d)", "", txt)         # 1 0 7 -> 107
+    txt = re.sub(r"(?<=\d)\s*\.\s*(?=\d)", ".", txt)   # 281 . 93 -> 281.93
     return txt
 
 def only_digits(s: str) -> str:
@@ -73,10 +69,9 @@ def dates_from_weekending(iso_saturday: str) -> Dict[str, str]:
         "Tuesday": (sat - dt.timedelta(days=4)).isoformat(),
     }
 
-# -------------------- day parsing (explicit blocks) --------------------
+# -------------------- day parsing --------------------
 
 def segment(text: str, start_label: str, end_label: str | None) -> str:
-    """Return the substring starting at 'start_label' up to 'end_label' (or end)."""
     m = re.search(rf"\b{start_label}\b", text, re.I)
     if not m:
         return ""
@@ -88,7 +83,21 @@ def segment(text: str, start_label: str, end_label: str | None) -> str:
     return text[start:]
 
 def extract_metrics(seg: str) -> Dict[str, str]:
-    """Find Stops, Parcels, Payment in the given segment (labels literal)."""
+    """
+    Prefer the 'Total' row:
+        Total  <stops>  <parcels>  £<payment>
+    If not found, fall back to separate labels inside the segment.
+    """
+    # Flexible 'Total' row: allow non-digits between captures, but keep order.
+    m = re.search(
+        r"Total\b[^0-9£]*?(\d{1,4})[^0-9£]+(\d{1,4})[^0-9£]+£?\s*([0-9]+(?:\.[0-9]{1,2})?)",
+        seg, re.I
+    )
+    if m:
+        stops, parcels, payment = m.group(1), m.group(2), m.group(3)
+        return {"stops": str(int(stops)), "parcels": str(int(parcels)), "payment": fmt_money(payment)}
+
+    # Fallback (rare): labelled values inside the block
     def grab_int(label: str) -> str:
         mm = re.search(rf"{label}\s*[:.]?\s*(\d+)", seg, re.I)
         return str(int(mm.group(1))) if mm else "0"
@@ -121,6 +130,7 @@ CSV_COLUMNS = [
 def build_rows(pdf_bytes: bytes) -> List[Dict[str, str]]:
     text = page1_text(pdf_bytes)
     meta = parse_meta(text)
+
     missing = []
     if "week_ending_iso" not in meta: missing.append("Week ending Saturday")
     if "route" not in meta:           missing.append("Route No.")
@@ -130,33 +140,32 @@ def build_rows(pdf_bytes: bytes) -> List[Dict[str, str]]:
 
     dates = dates_from_weekending(meta["week_ending_iso"])
 
-    # --- Monday ---
     mon = parse_monday(text)
-    row_mon = {
-        "Day": "Monday",
-        "Date": dates["Monday"],
-        "Stops": mon["stops"],
-        "Parcels": mon["parcels"],
-        "Payment": mon["payment"],
-        "Invoice Number": meta.get("invoice", ""),
-        "Route Number": meta.get("route", ""),
-        "Cost Centre Code": meta.get("cost_centre", ""),
-    }
-
-    # --- Tuesday ---
     tue = parse_tuesday(text)
-    row_tue = {
-        "Day": "Tuesday",
-        "Date": dates["Tuesday"],
-        "Stops": tue["stops"],
-        "Parcels": tue["parcels"],
-        "Payment": tue["payment"],
-        "Invoice Number": meta.get("invoice", ""),
-        "Route Number": meta.get("route", ""),
-        "Cost Centre Code": meta.get("cost_centre", ""),
-    }
 
-    return [row_mon, row_tue]
+    rows = [
+        {
+            "Day": "Monday",
+            "Date": dates["Monday"],
+            "Stops": mon["stops"],
+            "Parcels": mon["parcels"],
+            "Payment": mon["payment"],
+            "Invoice Number": meta.get("invoice", ""),
+            "Route Number": meta.get("route", ""),
+            "Cost Centre Code": meta.get("cost_centre", ""),
+        },
+        {
+            "Day": "Tuesday",
+            "Date": dates["Tuesday"],
+            "Stops": tue["stops"],
+            "Parcels": tue["parcels"],
+            "Payment": tue["payment"],
+            "Invoice Number": meta.get("invoice", ""),
+            "Route Number": meta.get("route", ""),
+            "Cost Centre Code": meta.get("cost_centre", ""),
+        },
+    ]
+    return rows
 
 def stream_csv(pdf_bytes: bytes, filename="weekly_summary_mon_tue.csv") -> StreamingResponse:
     def gen():
