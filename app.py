@@ -74,14 +74,12 @@ def grab_day_totals(text: str, day: str) -> Tuple[str, str, str]:
 
 def extract_first_pages(pdf_bytes: bytes) -> List[Dict[str,str]]:
     rows: List[Dict[str,str]] = []
- with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-    for page in pdf.pages:
-        page_text = page.extract_text() or ""
-        # Only treat this as an invoice "first page" if it has a Monday panel
-        if re.search(r"\bMonday\b", page_text, re.I):
-            # read header values (Route No, Invoice No, Cost Centre) from this page_text
-            # then call grab_day_totals(page_text, "Monday"/"Tuesday"/... ) for each day
-            
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for p in pdf.pages:
+            txt = p.extract_text() or ""
+            # Heuristic: first page of an invoice contains the day panels with "Monday"
+            if "Monday" not in txt:
+                continue
 
             header = grab_header(txt)
             sat = parse_week_ending(txt)
