@@ -2,7 +2,7 @@ import io
 import re
 import csv
 import datetime as dt
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional, List
 
 import pdfplumber
 import requests
@@ -10,144 +10,165 @@ from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="PF Weekly Summary (Monday row + Cost Centre Code)")
+app = FastAPI(title="PF Weekly Summary (All Days + Cost Centre Code)")
 
-# ---------- helpers ----------
+# -------------------- small helpers --------------------
 
 def _clean(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
 def _page1_text(pdf_bytes: bytes) -> str:
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        return pdf.pages[0].extract_text() or ""
+        first = pdf.pages[0]
+        # use layout extraction to keep ordering a bit better
+        txt = first.extract_text(layout=True) or first.extract_text() or ""
+    # normalize whitespace so regex across lines works
+    return re.sub(r"[ \t]+", " ", txt).replace("\n", " ")
 
-def _grab(label_regex: str, text: str, group: int = 1, flags: int = re.I) -> str:
-    """
-    Return the first capture group after a label.
-    Example: label_regex='Route\\s*No\\.?', will match 'Route No.' then capture the next token/value.
-    """
-    # Look for: <label> [: or . optional] <optional spaces> <value>
-    # Value is the rest of the line (not greedy) until newline or double-space break.
-    pat = re.compile(rf"{label_regex}\s*[:.]?\s*([^\n\r]+)", flags)
-    m = pat.search(text)
-    return _clean(m.group(group)) if m else ""
-
-def _week_ending_date(text: str) -> dt.date | None:
-    # Accept 14-09-25 or 14.09.25 or 14/09/25
-    m = re.search(r"Week\s*ending\s*Saturday\s*[:.]?\s*(\d{2})[-./](\d{2})[-./](\d{2})", text, re.I)
-    if not m:
-        return None
-    d, mth, yy = map(int, m.groups())
-    # assume 20xx
-    year = 2000 + yy if yy < 100 else yy
+def _fmt_money(x: str) -> str:
+    s = (x or "").replace(",", "").replace("£", "").strip()
+    if not s:
+        return "0.00"
     try:
-        return dt.date(year, mth, d)
-    except ValueError:
-        return None
+        return f"{float(s):.2f}"
+    except Exception:
+        # last resort: strip non-numeric, keep dot
+        s2 = re.sub(r"[^0-9.]", "", s)
+        return f"{float(s2 or 0):.2f}"
 
-def _monday_date_from_weekending(sat: dt.date) -> dt.date:
-    # Monday is 5 days before Saturday
-    return sat - dt.timedelta(days=5)
+def _only_digits(s: str) -> str:
+    return re.sub(r"\D+", "", s or "")
 
-def _find_day_metrics(day: str, text: str) -> Tuple[int, int, float] | None:
+# -------------------- parsing of page 1 --------------------
+
+DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+
+def parse_summary_page1(text: str) -> Dict[str, Dict[str, str]]:
     """
-    Look on page 1 for:
-      <Day> ... Total Stops: <int> ... Total Parcels: <int> ... Payment: <money>
-    Be flexible with spacing and line breaks.
+    Returns a dict:
+      meta: Route No, Invoice No, WeekEnding (ISO), CostCentre
+      days: {day: {"stops":.., "parcels":.., "payment":..}}
     """
-    pat = re.compile(
-        rf"{day}\b.*?"
-        r"Total\s*Stops\s*[:]\s*(\d+).*?"
-        r"Total\s*Parcels\s*[:]\s*(\d+).*?"
-        r"Payment\s*[:£]?\s*(\d+(?:\.\d{{1,2}})?)",
-        re.I | re.S
+    out = {"meta": {}, "days": {}}
+
+    # Route number (ensure we hit the actual label)
+    m = re.search(r"Route\s*No\.?\s*[:.]?\s*([A-Za-z0-9\-_/]+)", text, re.I)
+    if m:
+        out["meta"]["route"] = m.group(1).strip()
+
+    # Invoice number (accept an optional asterisk after "No")
+    m = re.search(r"Invoice\s*No\.?\*?\s*[:.]?\s*([A-Za-z0-9\-_/]+)", text, re.I)
+    if m:
+        out["meta"]["invoice"] = m.group(1).strip()
+
+    # Cost Centre Code (digits)
+    m = re.search(r"Cost\s*Centre\s*Code\s*[:.]?\s*([A-Za-z0-9]+)", text, re.I)
+    if m:
+        out["meta"]["cost_centre"] = _only_digits(m.group(1))
+
+    # Week ending Saturday dd.mm.yy / dd-mm-yy / dd/mm/yy
+    m = re.search(
+        r"Week\s*ending\s*Saturday\s*[:.]?\s*(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})",
+        text, re.I,
     )
-    m = pat.search(text)
-    if not m:
-        return None
-    stops = int(m.group(1))
-    parcels = int(m.group(2))
-    pay = float(m.group(3))
-    return stops, parcels, pay
+    if m:
+        raw = m.group(1)
+        # unify separators
+        d, mth, y = re.split(r"[./-]", raw)
+        d, mth, y = int(d), int(mth), int(y)
+        if y < 100:  # 25 -> 2025 (assume 2000s)
+            y += 2000
+        sat = dt.date(y, mth, d)
+        out["meta"]["week_ending_iso"] = sat.isoformat()
+    # If not found, meta will simply miss it (we’ll error later).
 
-def _extract_structured_fields(text: str) -> Dict[str, str]:
-    """
-    Pulls the top/bottom identifiers strictly from page 1 labels.
-    We anchor to the **labels** to avoid picking up stray words like
-    'Collection Stop 150%'.
-    """
-    out: Dict[str, str] = {}
-
-    # Route No (stick to the label cell on page 1)
-    # Grab the text on the same line as 'Route No.' only.
-    out["route_no"] = _grab(r"Route\s*No\.?", text)
-    # Only keep the simple token at the start (avoid extra trailing commentary)
-    out["route_no"] = _clean(re.split(r"\s{2,}", out["route_no"])[0])
-
-    # Invoice No
-    out["invoice_no"] = _grab(r"Invoice\s*No\.?\*?", text)
-
-    # Cost Centre Code (bottom block on page 1)
-    m = re.search(r"Cost\s*Centre\s*Code\s*[:.]?\s*([A-Za-z]?\d+)", text, re.I)
-    out["cost_centre"] = _clean(m.group(1)) if m else ""
+    # Day blocks: "<Day> ... Total Stops: X ... Total Parcels: Y ... Payment: Z"
+    # Make it tolerant about spaces and punctuation.
+    for day in DAY_NAMES:
+        pat = (
+            rf"{day}\b.*?"
+            r"Total\s*Stops\s*[:.]?\s*(\d+)\D+?"
+            r"Total\s*Parcels\s*[:.]?\s*(\d+)\D+?"
+            r"Payment\s*[:.]?\s*£?\s*([0-9]+(?:\.[0-9]{{1,2}})?)"
+        )
+        m = re.search(pat, text, re.I | re.S)
+        if m:
+            stops, parcels, pay = m.groups()
+            out["days"][day] = {
+                "stops": str(int(stops)),               # remove leading zeros
+                "parcels": str(int(parcels)),
+                "payment": _fmt_money(pay),
+            }
 
     return out
 
-# ---------- CSV builders ----------
+def dates_from_weekending(iso_saturday: str) -> Dict[str, str]:
+    sat = dt.date.fromisoformat(iso_saturday)
+    # map Mon..Sat to actual dates
+    return {
+        "Monday":    (sat - dt.timedelta(days=5)).isoformat(),
+        "Tuesday":   (sat - dt.timedelta(days=4)).isoformat(),
+        "Wednesday": (sat - dt.timedelta(days=3)).isoformat(),
+        "Thursday":  (sat - dt.timedelta(days=2)).isoformat(),
+        "Friday":    (sat - dt.timedelta(days=1)).isoformat(),
+        "Saturday":  sat.isoformat(),
+    }
 
-def _csv_from_bytes(pdf_bytes: bytes) -> StreamingResponse:
-    """
-    Build a single-row CSV for **Monday** with:
-    Day,Date,Stops,Parcels,Payment,Invoice Number,Route Number,Cost Centre Code
-    """
+# -------------------- CSV building --------------------
+
+CSV_COLUMNS = [
+    "Day", "Date", "Stops", "Parcels", "Payment",
+    "Invoice Number", "Route Number", "Cost Centre Code",
+]
+
+def build_rows(pdf_bytes: bytes) -> List[Dict[str, str]]:
     text = _page1_text(pdf_bytes)
-    if not text:
-        return JSONResponse(status_code=400, content={"error": "No text found on page 1"})
+    parsed = parse_summary_page1(text)
 
-    # Required identifiers
-    ids = _extract_structured_fields(text)
-    route_no = ids.get("route_no", "")
-    invoice_no = ids.get("invoice_no", "")
-    cost_centre = ids.get("cost_centre", "")
+    # Validate must-have fields
+    missing = []
+    if not parsed["meta"].get("week_ending_iso"):
+        missing.append("Week ending Saturday")
+    if not parsed["meta"].get("route"):
+        missing.append("Route No.")
+    if not parsed["meta"].get("invoice"):
+        missing.append("Invoice No.")
+    if missing:
+        raise ValueError(f"Missing required field(s): {', '.join(missing)}")
 
-    # Week-ending → Monday date
-    sat = _week_ending_date(text)
-    if not sat:
-        return JSONResponse(status_code=400, content={"error": "Week ending Saturday date not found"})
-    monday = _monday_date_from_weekending(sat)
+    dates = dates_from_weekending(parsed["meta"]["week_ending_iso"])
+    route = parsed["meta"].get("route", "")
+    invoice = parsed["meta"].get("invoice", "")
+    cost_centre = parsed["meta"].get("cost_centre", "")
 
-    # Monday metrics
-    metrics = _find_day_metrics("Monday", text)
-    if not metrics:
-        # fall back to zeros if the block isn't present
-        stops, parcels, pay = 0, 0, 0.0
-    else:
-        stops, parcels, pay = metrics
+    rows: List[Dict[str, str]] = []
+    for day in DAY_NAMES:
+        day_data = parsed["days"].get(day, {"stops": "0", "parcels": "0", "payment": "0.00"})
+        rows.append({
+            "Day": day,
+            "Date": dates[day],
+            "Stops": day_data["stops"],
+            "Parcels": day_data["parcels"],
+            "Payment": day_data["payment"],
+            "Invoice Number": invoice,
+            "Route Number": route,
+            "Cost Centre Code": cost_centre,
+        })
+    return rows
 
-    # Compose CSV in memory
+def stream_csv(pdf_bytes: bytes, filename="weekly_summary.csv") -> StreamingResponse:
     def gen():
         buf = io.StringIO()
-        w = csv.writer(buf)
-        w.writerow(["Day", "Date", "Stops", "Parcels", "Payment", "Invoice Number", "Route Number", "Cost Centre Code"])
-        w.writerow([
-            "Monday",
-            monday.strftime("%Y-%m-%d"),
-            stops,
-            parcels,
-            f"{pay:.2f}",
-            invoice_no,
-            route_no,
-            cost_centre
-        ])
-        yield buf.getvalue()
+        w = csv.DictWriter(buf, fieldnames=CSV_COLUMNS)
+        w.writeheader()
+        yield buf.getvalue(); buf.seek(0); buf.truncate(0)
+        for r in build_rows(pdf_bytes):
+            w.writerow(r)
+            yield buf.getvalue(); buf.seek(0); buf.truncate(0)
+    return StreamingResponse(gen(), media_type="text/csv",
+                             headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
-    return StreamingResponse(
-        gen(),
-        media_type="text/csv",
-        headers={"Content-Disposition": 'attachment; filename="monday_summary.csv"'}
-    )
-
-# ---------- API ----------
+# -------------------- API --------------------
 
 class UrlIn(BaseModel):
     file_url: str
@@ -159,10 +180,10 @@ def healthz():
 @app.post("/process/url")
 def process_url(body: UrlIn):
     try:
-        r = requests.get(body.file_url, timeout=60)
-        r.raise_for_status()
-        pdf_bytes = r.content
-        return _csv_from_bytes(pdf_bytes)
+        with requests.get(body.file_url, timeout=60) as r:
+            r.raise_for_status()
+            pdf_bytes = r.content
+        return stream_csv(pdf_bytes, "weekly_summary.csv")
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
 
@@ -170,7 +191,8 @@ def process_url(body: UrlIn):
 async def process_file(file: UploadFile = File(...)):
     try:
         pdf_bytes = await file.read()
-        return _csv_from_bytes(pdf_bytes)
+        return stream_csv(pdf_bytes, "weekly_summary.csv")
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
+
 
