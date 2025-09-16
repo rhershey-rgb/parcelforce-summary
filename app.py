@@ -131,7 +131,7 @@ def process_url(body: UrlIn):
 
         # For now: return Monday + Tuesday only (days_wanted=2).
         # When you’re ready to extend, change to 6 for the full week.
-        return make_csv_for_days(meta, totals, days_wanted=2)
+        return make_csv_for_days(meta, totals, days_wanted=6)
 
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
