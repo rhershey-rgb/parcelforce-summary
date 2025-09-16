@@ -37,18 +37,34 @@ def _grab_invoice(page1: str) -> str:
     return val
 
 def _grab_route(page1: str) -> str:
-    # Prefer the first pure number on the Route line (avoids "Collection Stop 150%")
-    m = re.search(r"^Route\s*No[^\r\n:]*[:.]?\s*(\d{1,5})(?=\D|$)", page1, re.I | re.M)
-    if m: return m.group(1)
-    # Fallback: take the whole line's value then pick first number token
-    m = re.search(r"^Route\s*No[^\r\n:]*[:.]?\s*([^\r\n]+)$", page1, re.I | re.M)
+    """
+    Extract the route number from the header table.
+    We anchor on the literal 'Route No' label, then only scan a tiny window
+    (same line or the next line/cell). This avoids accidental matches like
+    'Collection Stop 150%'.
+    """
+    # 1) find the label anywhere
+    m = re.search(r"Route\s*No\.?", page1, re.I)
     if m:
-        val = m.group(1)
-        m2 = re.search(r"\b(\d{1,5})\b", val)
-        return m2.group(1) if m2 else val.strip()
-    # Last resort: anywhere
-    m = re.search(r"Route\s*No[^\r\n:]*[:.]?\s*(\d{1,5})", page1, re.I)
-    return m.group(1) if m else ""
+        # window immediately after the label (same line / next cell)
+        window = page1[m.end(): m.end() + 120]
+        # also include a bit before & after in case of line breaks/cell boundaries
+        block = page1[max(0, m.start() - 20): m.end() + 200]
+        # prefer the first 1–5 digit token near the label
+        m2 = re.search(r"\b(\d{1,5})\b", window)
+        if not m2:
+            m2 = re.search(r"Route\s*No[^\d\r\n]{0,40}\b(\d{1,5})\b", block, re.I)
+        if m2:
+            return m2.group(1)
+
+    # 2) fallback: scan only the very top of the page (header area), not the whole page
+    top = page1[:1000]
+    m3 = re.search(r"Route\s*No[^\d]{0,40}\b(\d{1,5})\b", top, re.I)
+    if m3:
+        return m3.group(1)
+
+    return ""
+
 
 def _find_week_ending(page1: str) -> dt.date:
     m = re.search(r"^Week\s*ending\s*Saturday\s*[:\-]?\s*([0-9]{1,2}[./ -][0-9]{1,2}[./ -][0-9]{2,4})",
