@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.responses import Response, JSONResponse
 
-app = FastAPI(title="PF Weekly (Monday only) → CSV", version="1.0.1")
+app = FastAPI(title="PF Weekly (Monday only) → CSV", version="1.0.2")
 
 # ---------- helpers ----------
 def _money(x: str) -> str:
@@ -29,27 +29,38 @@ def _page1_text(pdf_bytes: bytes) -> str:
         return pdf.pages[0].extract_text() or ""
 
 def _grab_invoice(page1: str) -> str:
-    # Handles: "Invoice No.*: LON2332524" and similar
+    # Handles "Invoice No.*: LON2332524" etc.; strip leading symbols.
     m = re.search(r"^Invoice\s*No[^\r\n:]*:\s*([^\r\n]+)$", page1, re.I | re.M)
-    return (m.group(1).strip() if m else "")
+    if not m: return ""
+    val = m.group(1).strip()
+    val = re.sub(r"^[^A-Za-z0-9]+", "", val)  # drop "*: " or similar
+    return val
 
 def _grab_route(page1: str) -> str:
-    # Handles: "Route No. 233" or "Route No: 233"
+    # Prefer the first pure number on the Route line (avoids "Collection Stop 150%")
+    m = re.search(r"^Route\s*No[^\r\n:]*[:.]?\s*(\d{1,5})(?=\D|$)", page1, re.I | re.M)
+    if m: return m.group(1)
+    # Fallback: take the whole line's value then pick first number token
     m = re.search(r"^Route\s*No[^\r\n:]*[:.]?\s*([^\r\n]+)$", page1, re.I | re.M)
-    return (m.group(1).strip() if m else "")
+    if m:
+        val = m.group(1)
+        m2 = re.search(r"\b(\d{1,5})\b", val)
+        return m2.group(1) if m2 else val.strip()
+    # Last resort: anywhere
+    m = re.search(r"Route\s*No[^\r\n:]*[:.]?\s*(\d{1,5})", page1, re.I)
+    return m.group(1) if m else ""
 
 def _find_week_ending(page1: str) -> dt.date:
     m = re.search(r"^Week\s*ending\s*Saturday\s*[:\-]?\s*([0-9]{1,2}[./ -][0-9]{1,2}[./ -][0-9]{2,4})",
                   page1, re.I | re.M)
     if m: return _date_from_we(m.group(1))
-    # fallback near "Week"
     m = re.search(r"Week.{0,120}?(\d{1,2})[./ -](\d{1,2})[./ -](\d{2,4})", page1, re.I | re.S)
     if not m: raise ValueError("Week ending Saturday date not found")
     return _date_from_we(f"{m.group(1)}/{m.group(2)}/{m.group(3)}")
 
 def _monday_numbers(page1: str) -> Tuple[int,int,str]:
     """
-    Your PDF prints 'Monday Tuesday' together, then a line like:
+    Many PDFs print 'Monday Tuesday' together, then:
       'Total 107 226 £281.93  Total 105 168 £263.48'
     This grabs the first triple for Monday.
     """
@@ -60,10 +71,9 @@ def _monday_numbers(page1: str) -> Tuple[int,int,str]:
     )
     m = pat.search(txt)
     if m:
-        stops, parcels, pay = int(m.group(1)), int(m.group(2)), _money(m.group(3))
-        return stops, parcels, pay
+        return int(m.group(1)), int(m.group(2)), _money(m.group(3))
 
-    # fallback: local region from "Monday" up to next sentinel then find first "Total a b £c"
+    # Fallback: local region from "Monday" up to next sentinel then first "Total a b £c"
     start_m = re.search(r"\bMonday\b:?", page1, re.I)
     if start_m:
         start = start_m.start()
@@ -78,7 +88,6 @@ def _monday_numbers(page1: str) -> Tuple[int,int,str]:
         if m3:
             return int(m3.group(1)), int(m3.group(2)), _money(m3.group(3))
 
-    # last resort: zeros
     return 0,0,"0.00"
 
 # ---------- API ----------
@@ -104,7 +113,6 @@ def process_url(body: UrlIn):
 
         stops, parcels, pay = _monday_numbers(page1)
 
-        # CSV (one row)
         cols = ["Day","Date","Stops","Parcels","Payment","Invoice Number","Route Number"]
         buf = io.StringIO()
         w = csv.DictWriter(buf, fieldnames=cols)
