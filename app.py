@@ -47,31 +47,24 @@ def grab_header(text: str) -> Dict[str,str]:
 
 def grab_day_totals(text: str, day: str) -> Tuple[str, str, str]:
     """
-    Robust: find the first 'Total <stops> <parcels> £<payment>' that occurs
-    *after* the given day label, allowing column-order jumps. Limit the search
-    window to avoid accidentally crossing into a different section.
+    Return (stops, parcels, payment) for a given day panel found on THIS PAGE.
+    We take the FIRST 'Total …' line after the day label to avoid picking up
+    the page's weekly grand total.
     """
-    # where does the day label start?
+    # 1) Find where the day's panel starts
     mstart = re.search(rf"\b{re.escape(day)}\b", text, flags=re.I)
     if not mstart:
         return ("0", "0", "0.00")
-    start = mstart.start()
 
-    # Search window: from the day label forward N characters
-    # (2000–3000 chars is usually plenty for one day panel)
-    window = text[start:start + 3000]
+    # 2) Scan forward from the day label; take the FIRST 'Total …' line
+    tail = text[mstart.start():]
 
-    # Prefer the LAST Total in the window (in case there are small sub-totals above)
-    mtotals = list(re.finditer(r"Total\s+(\d+)\s+(\d+)\s+£?\s*([\d\.,]+)",
-                               window, flags=re.I))
-    if mtotals:
-        m = mtotals[-1]
-        stops, parcels, pay = m.group(1), m.group(2), m.group(3)
-        return (stops.strip(), parcels.strip(), money(pay))
+    # anchor 'Total' at line start to avoid matching narrative uses of the word
+    m = re.search(r"(?mi)^[ \t]*Total[ \t]+(\d+)[ \t]+(\d+)[ \t]+£?[ \t]*([\d\.,]+)", tail)
+    if not m:
+        # very defensive fallback: anywhere after the label
+        m = re.search(r"Total\s+(\d+)\s+(\d+)\s+£?\s*([\d\.,]+)", tail, flags=re.I)
 
-    # Fallback: scan from day label to end of page (just in case window was too small)
-    m = re.search(r"Total\s+(\d+)\s+(\d+)\s+£?\s*([\d\.,]+)",
-                  text[start:], flags=re.I)
     if m:
         stops, parcels, pay = m.group(1), m.group(2), m.group(3)
         return (stops.strip(), parcels.strip(), money(pay))
@@ -81,12 +74,14 @@ def grab_day_totals(text: str, day: str) -> Tuple[str, str, str]:
 
 def extract_first_pages(pdf_bytes: bytes) -> List[Dict[str,str]]:
     rows: List[Dict[str,str]] = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for p in pdf.pages:
-            txt = p.extract_text() or ""
-            # Heuristic: first page of an invoice contains the day panels with "Monday"
-            if "Monday" not in txt:
-                continue
+ with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+    for page in pdf.pages:
+        page_text = page.extract_text() or ""
+        # Only treat this as an invoice "first page" if it has a Monday panel
+        if re.search(r"\bMonday\b", page_text, re.I):
+            # read header values (Route No, Invoice No, Cost Centre) from this page_text
+            # then call grab_day_totals(page_text, "Monday"/"Tuesday"/... ) for each day
+            
 
             header = grab_header(txt)
             sat = parse_week_ending(txt)
