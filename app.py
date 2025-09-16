@@ -136,8 +136,3 @@ def stream_csv(rows: List[Dict[str,str]]) -> StreamingResponse:
     return StreamingResponse(iter([buf.read()]),
                              media_type="text/csv",
                              headers={"Content-Disposition": 'attachment; filename="weekly-summary.csv"'})
-
-
-    except Exception as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
-
