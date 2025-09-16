@@ -1,187 +1,120 @@
-import io
-import re
-import csv
-import datetime as dt
-from typing import Dict, List
-
-import pdfplumber
+import io, re, csv, datetime as dt
+from typing import List, Tuple
 import requests
-from fastapi import FastAPI, UploadFile, File
+import pdfplumber
+from fastapi import FastAPI
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="PF Weekly Summary — Mon+Tue with Total-row parsing")
+app = FastAPI(title="PF Weekly Summary → CSV", version="0.3.0")
 
-# -------------------- helpers --------------------
-
-def page1_text(pdf_bytes: bytes) -> str:
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        txt = (pdf.pages[0].extract_text(layout=True)
-               or pdf.pages[0].extract_text()
-               or "")
-    # Normalize whitespace and collapse spaced-out numbers
-    txt = txt.replace("\n", " ")
-    txt = re.sub(r"[ \t]+", " ", txt)
-    txt = re.sub(r"(?<=\d)\s+(?=\d)", "", txt)         # 1 0 7 -> 107
-    txt = re.sub(r"(?<=\d)\s*\.\s*(?=\d)", ".", txt)   # 281 . 93 -> 281.93
-    return txt
-
-def only_digits(s: str) -> str:
-    return re.sub(r"\D+", "", s or "")
-
-def fmt_money(s: str) -> str:
-    s = (s or "").strip().replace(",", "").replace("£", "")
-    if not s:
-        return "0.00"
-    try:
-        return f"{float(s):.2f}"
-    except Exception:
-        s2 = re.sub(r"[^0-9.]", "", s)
-        return f"{float(s2 or 0):.2f}"
-
-# -------------------- meta --------------------
-
-def parse_meta(text: str) -> Dict[str, str]:
-    meta: Dict[str, str] = {}
-
-    m = re.search(r"Route\s*No\.?\s*[:.]?\s*([A-Za-z0-9\-_/]+)", text, re.I)
-    if m: meta["route"] = m.group(1).strip()
-
-    m = re.search(r"Invoice\s*No\.?\*?\s*[:.]?\s*([A-Za-z0-9\-_/]+)", text, re.I)
-    if m: meta["invoice"] = m.group(1).strip()
-
-    m = re.search(r"Cost\s*Centre\s*Code\s*[:.]?\s*([A-Za-z0-9]+)", text, re.I)
-    if m: meta["cost_centre"] = only_digits(m.group(1))
-
-    m = re.search(r"Week\s*ending\s*Saturday\s*[:.]?\s*(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})", text, re.I)
-    if m:
-        d, mth, y = re.split(r"[./-]", m.group(1))
-        d, mth, y = int(d), int(mth), int(y)
-        if y < 100: y += 2000
-        meta["week_ending_iso"] = dt.date(y, mth, d).isoformat()
-
-    return meta
-
-def dates_from_weekending(iso_saturday: str) -> Dict[str, str]:
-    sat = dt.date.fromisoformat(iso_saturday)
-    return {
-        "Monday":  (sat - dt.timedelta(days=5)).isoformat(),
-        "Tuesday": (sat - dt.timedelta(days=4)).isoformat(),
-    }
-
-# -------------------- day parsing --------------------
-
-def segment(text: str, start_label: str, end_label: str | None) -> str:
-    m = re.search(rf"\b{start_label}\b", text, re.I)
-    if not m:
-        return ""
-    start = m.end()
-    if end_label:
-        n = re.search(rf"\b{end_label}\b", text[start:], re.I)
-        if n:
-            return text[start:start + n.start()]
-    return text[start:]
-
-def extract_metrics(seg: str) -> Dict[str, str]:
-    """
-    Prefer the 'Total' row:
-        Total  <stops>  <parcels>  £<payment>
-    If not found, fall back to separate labels inside the segment.
-    """
-    # Flexible 'Total' row: allow non-digits between captures, but keep order.
-    m = re.search(
-        r"Total\b[^0-9£]*?(\d{1,4})[^0-9£]+(\d{1,4})[^0-9£]+£?\s*([0-9]+(?:\.[0-9]{1,2})?)",
-        seg, re.I
-    )
-    if m:
-        stops, parcels, payment = m.group(1), m.group(2), m.group(3)
-        return {"stops": str(int(stops)), "parcels": str(int(parcels)), "payment": fmt_money(payment)}
-
-    # Fallback (rare): labelled values inside the block
-    def grab_int(label: str) -> str:
-        mm = re.search(rf"{label}\s*[:.]?\s*(\d+)", seg, re.I)
-        return str(int(mm.group(1))) if mm else "0"
-
-    def grab_money(label: str) -> str:
-        mm = re.search(rf"{label}\s*[:.]?\s*£?\s*([0-9]+(?:\.[0-9]{{1,2}})?)", seg, re.I)
-        return fmt_money(mm.group(1)) if mm else "0.00"
-
-    return {
-        "stops":   grab_int("Stops"),
-        "parcels": grab_int("Parcels"),
-        "payment": grab_money("Payment"),
-    }
-
-def parse_monday(text: str) -> Dict[str, str]:
-    mon_seg = segment(text, "Monday", "Tuesday")
-    return extract_metrics(mon_seg)
-
-def parse_tuesday(text: str) -> Dict[str, str]:
-    tue_seg = segment(text, "Tuesday", "Wednesday")
-    return extract_metrics(tue_seg)
-
-# -------------------- CSV assembly --------------------
-
-CSV_COLUMNS = [
-    "Day", "Date", "Stops", "Parcels", "Payment",
-    "Invoice Number", "Route Number", "Cost Centre Code",
-]
-
-def build_rows(pdf_bytes: bytes) -> List[Dict[str, str]]:
-    text = page1_text(pdf_bytes)
-    meta = parse_meta(text)
-
-    missing = []
-    if "week_ending_iso" not in meta: missing.append("Week ending Saturday")
-    if "route" not in meta:           missing.append("Route No.")
-    if "invoice" not in meta:         missing.append("Invoice No.")
-    if missing:
-        raise ValueError(f"Missing required field(s): {', '.join(missing)}")
-
-    dates = dates_from_weekending(meta["week_ending_iso"])
-
-    mon = parse_monday(text)
-    tue = parse_tuesday(text)
-
-    rows = [
-        {
-            "Day": "Monday",
-            "Date": dates["Monday"],
-            "Stops": mon["stops"],
-            "Parcels": mon["parcels"],
-            "Payment": mon["payment"],
-            "Invoice Number": meta.get("invoice", ""),
-            "Route Number": meta.get("route", ""),
-            "Cost Centre Code": meta.get("cost_centre", ""),
-        },
-        {
-            "Day": "Tuesday",
-            "Date": dates["Tuesday"],
-            "Stops": tue["stops"],
-            "Parcels": tue["parcels"],
-            "Payment": tue["payment"],
-            "Invoice Number": meta.get("invoice", ""),
-            "Route Number": meta.get("route", ""),
-            "Cost Centre Code": meta.get("cost_centre", ""),
-        },
-    ]
-    return rows
-
-def stream_csv(pdf_bytes: bytes, filename="weekly_summary_mon_tue.csv") -> StreamingResponse:
-    def gen():
-        buf = io.StringIO()
-        w = csv.DictWriter(buf, fieldnames=CSV_COLUMNS)
-        w.writeheader(); yield buf.getvalue(); buf.seek(0); buf.truncate(0)
-        for r in build_rows(pdf_bytes):
-            w.writerow(r)
-            yield buf.getvalue(); buf.seek(0); buf.truncate(0)
-    return StreamingResponse(gen(), media_type="text/csv",
-                             headers={"Content-Disposition": f'attachment; filename="{filename}"'})
-
-# -------------------- API --------------------
+DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
 
 class UrlIn(BaseModel):
     file_url: str
+
+# ---------- helpers ----------
+
+def first_page_text(pdf_bytes: bytes) -> str:
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        return pdf.pages[0].extract_text() or ""
+
+def grab_meta(text: str) -> dict:
+    def find(pat, default=""):
+        m = re.search(pat, text, flags=re.I)
+        return (m.group(1).strip() if m else default)
+
+    # Week ending Saturday e.g. 14-09-25 or 14/09/2025
+    wek = find(r"Week\s*ending\s*Saturday\s*([0-9]{1,2}[-/][0-9]{1,2}[-/][0-9]{2,4})")
+    sat = None
+    if wek:
+        dd, mm, yy = re.split(r"[-/]", wek)
+        yy = int(yy)
+        # two-digit → 2000s
+        if yy < 100:
+            yy += 2000
+        sat = dt.date(yy, int(mm), int(dd))
+
+    invoice = find(r"Invoice\s*No\.?\*?:?\s*([A-Za-z0-9\-]+)")
+    route   = find(r"Route\s*No\.?\s*[:.]?\s*([A-Za-z0-9\-_/]+)")
+    cost    = find(r"Cost\s*Centre\s*Code.*?([0-9]{4,})")
+
+    return {"sat": sat, "invoice": invoice, "route": route, "cost": cost}
+
+def monday_to_saturday_dates(saturday: dt.date) -> List[dt.date]:
+    # Monday..Saturday relative to the Saturday week-ending date
+    return [
+        saturday - dt.timedelta(days=5),
+        saturday - dt.timedelta(days=4),
+        saturday - dt.timedelta(days=3),
+        saturday - dt.timedelta(days=2),
+        saturday - dt.timedelta(days=1),
+        saturday,
+    ]
+
+def first_six_totals(text: str) -> List[Tuple[int,int,float]]:
+    """
+    Find the first six occurrences of:
+      'Total <stops> <parcels> £<amount>'
+    in page 1 text order. These correspond to Monday..Saturday.
+    """
+    totals = []
+    for m in re.finditer(r"Total\s+(\d+)\s+(\d+)\s+£\s?(\d+(?:\.\d{2})?)", text, flags=re.I):
+        stops = int(m.group(1))
+        parcels = int(m.group(2))
+        pay = float(m.group(3))
+        totals.append((stops, parcels, pay))
+        if len(totals) == 6:
+            break
+    return totals
+
+def make_csv_for_days(meta: dict, totals: List[Tuple[int,int,float]], days_wanted: int = 2) -> StreamingResponse:
+    """
+    Build CSV for the first `days_wanted` days (1=Monday only, 2=Mon+Tue, etc.)
+    """
+    if not meta["sat"]:
+        return JSONResponse(status_code=400, content={"error": "Week ending Saturday date not found"})
+
+    dates = monday_to_saturday_dates(meta["sat"])
+    rows = []
+    # pad totals if PDF had fewer than needed
+    while len(totals) < 6:
+        totals.append((0,0,0.0))
+
+    for i in range(days_wanted):
+        day = DAY_NAMES[i]
+        d = dates[i]
+        s, p, pay = totals[i]
+        rows.append({
+            "Day": day,
+            "Date": d.isoformat(),
+            "Stops": s,
+            "Parcels": p,
+            "Payment": f"{pay:.2f}",
+            "Invoice Number": meta["invoice"],
+            "Route Number": meta["route"],
+            "Cost Centre Code": meta["cost"],
+        })
+
+    def gen():
+        buf = io.StringIO()
+        w = csv.DictWriter(buf, fieldnames=[
+            "Day","Date","Stops","Parcels","Payment",
+            "Invoice Number","Route Number","Cost Centre Code"
+        ])
+        w.writeheader()
+        yield buf.getvalue(); buf.seek(0); buf.truncate(0)
+        for r in rows:
+            w.writerow(r)
+            yield buf.getvalue(); buf.seek(0); buf.truncate(0)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="summary.csv"'}
+    )
+
+# ---------- endpoints ----------
 
 @app.get("/healthz")
 def healthz():
@@ -190,17 +123,16 @@ def healthz():
 @app.post("/process/url")
 def process_url(body: UrlIn):
     try:
-        with requests.get(body.file_url, timeout=60) as r:
-            r.raise_for_status()
-            pdf_bytes = r.content
-        return stream_csv(pdf_bytes, "weekly_summary_mon_tue.csv")
+        r = requests.get(body.file_url, timeout=60)
+        r.raise_for_status()
+        text = first_page_text(r.content)
+        meta = grab_meta(text)
+        totals = first_six_totals(text)
+
+        # For now: return Monday + Tuesday only (days_wanted=2).
+        # When you’re ready to extend, change to 6 for the full week.
+        return make_csv_for_days(meta, totals, days_wanted=2)
+
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
 
-@app.post("/process/file")
-async def process_file(file: UploadFile = File(...)):
-    try:
-        pdf_bytes = await file.read()
-        return stream_csv(pdf_bytes, "weekly_summary_mon_tue.csv")
-    except Exception as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
