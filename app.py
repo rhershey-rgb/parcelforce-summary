@@ -1,196 +1,214 @@
 import io
-import csv
 import re
+import csv
 import datetime as dt
-from typing import Dict, List, Iterable
+from typing import Dict, List, Tuple
 
-import requests
 import pdfplumber
+import requests
 from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="Parcelforce Weekly Summary → CSV", version="1.0.2")
+app = FastAPI(title="PF Weekly Summary → CSV", version="1.1.0")
 
-# ---------- Models ----------
-class UrlIn(BaseModel):
-    file_url: str
+# ------------------------
+# Helpers
+# ------------------------
 
-# ---------- Helpers ----------
-DAY_ORDER = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"]
+DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
 
-DAY_TO_OFFSET = {
-    "Monday": 5,
-    "Tuesday": 4,
-    "Wednesday": 3,
-    "Thursday": 2,
-    "Friday": 1,
-    "Saturday": 0,
-}
+def norm(s: str) -> str:
+    """Normalize whitespace and NBSP; keep it single-line friendly while
+    allowing our regex to span across former line breaks."""
+    if not s:
+        return ""
+    s = s.replace("\u00A0", " ")  # NBSP -> space
+    # Keep one space for any whitespace/newline run
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-HEADERS = [
-    "Date",
-    "Route No",
-    "Total Stops",
-    "Total Parcels",
-    "Payment",
-    "Internal Reference",
-    "Contract Number",
-    "Cost Centre Code",
-]
+def float_2(s: str) -> str:
+    if s is None or s == "":
+        return "0.00"
+    s = s.replace(",", "")
+    try:
+        return f"{float(s):.2f}"
+    except:
+        return "0.00"
 
 def parse_week_ending(text: str) -> dt.date:
     """
-    Find 'Week ending Saturday:14.09.25' -> datetime.date(2025,9,14)
+    Find a 'Week ending ... 14.09.25' style date robustly.
+    Accepts dots/slashes/dashes/spaces, optional 'Saturday' or 'Sat',
+    optional colon, and 2- or 4-digit years; tolerates newlines.
     """
-    m = re.search(r"Week\s+ending\s+Saturday\s*:\s*(\d{2})\.(\d{2})\.(\d{2})", text, re.I)
+    t = text.replace("\u00A0", " ")
+    t = re.sub(r"[ \t]+", " ", t)
+
+    pat = re.compile(
+        r"Week\s*end(?:ing)?\s*(?:Saturday|Sat)?\s*[:\-]?\s*"
+        r"(\d{1,2})[.\-\/ ](\d{1,2})[.\-\/ ](\d{2,4})",
+        re.I | re.S,
+    )
+    m = pat.search(t)
+
+    # Fallback: any dd sep mm sep yy/yyyy within ~120 chars of "Week"
+    if not m:
+        m = re.search(
+            r"Week.{0,120}?(\d{1,2})[.\-\/ ](\d{1,2})[.\-\/ ](\d{2,4})",
+            t, re.I | re.S
+        )
+
     if not m:
         raise ValueError("Week ending Saturday date not found")
-    d, mth, y2 = map(int, m.groups())
-    year = 2000 + y2  # assume 20xx
-    return dt.date(year, mth, d)
 
-def grab_field(text: str, label_pattern: str) -> str:
+    d, mth, y = map(int, m.groups())
+    if y < 100:
+        y += 2000
+    return dt.date(y, mth, d)
+
+def extract_meta(text: str) -> Dict[str, str]:
     """
-    Grab a single token or token-ish after a label (e.g., 'Route No', 'Invoice No', etc).
+    Grab the freeform metadata fields with very tolerant patterns.
     """
-    # Try a tolerant “value on same line” pattern
-    m = re.search(
-        rf"{label_pattern}\s*[:.]?\s*([^\s\r\n]+.*?)(?:\r?\n|$)", text, re.I
+    def grab(label_pat: str, capture_pat: str = r"[:\- ]\s*([\w\-\/_\.]+)"):
+        # Look for <label> : value   (allow dot/slash/underscore in value)
+        m = re.search(label_pat + r"\s*" + capture_pat, text, re.I)
+        return m.group(1).strip() if m else ""
+
+    return {
+        "Route No":           grab(r"Route\s*No\.?"),
+        "Invoice No":         grab(r"Invoice\s*No\.?"),
+        "Internal Reference": grab(r"Internal\s*Reference"),
+        "Contract Number":    grab(r"Contract\s*Number"),
+        "Cost Centre Code":   grab(r"Cost\s*Centre\s*Code"),
+    }
+
+# One flexible pattern per weekday to grab the 3 numbers
+def build_day_regex(day: str) -> re.Pattern:
+    """
+    Example text (with or without spaces/line breaks):
+      "Tuesday Total Stops:105 Total Parcels:168 Payment:263.48"
+    We allow arbitrary junk/newlines between the tokens, and optional currency sign.
+    """
+    pat = (
+        rf"{day}\b.*?"
+        r"Total\s*Stops\s*[:\-]?\s*(\d+)\D+"
+        r"Total\s*Parcels\s*[:\-]?\s*(\d+)\D+"
+        r"Payment\s*[:\-]?\s*£?\s*([0-9]+(?:[.,][0-9]{{2}})?)"
     )
-    return (m.group(1).strip() if m else "")
+    return re.compile(pat, re.I | re.S)
 
-def parse_totals(text: str) -> List[Dict[str, str]]:
+DAY_PATTERNS = {d: build_day_regex(d) for d in DAYS}
+
+def extract_day_triplets(text: str) -> Dict[str, Tuple[int,int,str]]:
     """
-    Extract per-day totals like:
-    Monday Total Stops: 107 Total Parcels: 226 Payment:281.93
+    Return { day: (stops, parcels, payment_str) }.
+    If a day's block isn't found, default to zeros.
     """
+    out: Dict[str, Tuple[int,int,str]] = {}
+    for d in DAYS:
+        m = DAY_PATTERNS[d].search(text)
+        if m:
+            stops = int(m.group(1))
+            parcels = int(m.group(2))
+            pay = float_2(m.group(3))
+        else:
+            stops, parcels, pay = 0, 0, "0.00"
+        out[d] = (stops, parcels, pay)
+    return out
+
+def compute_dates(sat: dt.date) -> Dict[str, dt.date]:
+    # Monday is Saturday - 5, Tuesday -4, ..., Saturday 0
+    offsets = {"Monday": -5, "Tuesday": -4, "Wednesday": -3, "Thursday": -2, "Friday": -1, "Saturday": 0}
+    return {d: sat + dt.timedelta(days=off) for d, off in offsets.items()}
+
+def pdf_to_text(pdf_bytes: bytes) -> str:
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        pages = []
+        for p in pdf.pages:
+            t = p.extract_text() or ""
+            pages.append(t)
+    return "\n".join(pages)
+
+def make_csv(rows: List[Dict[str, str]]) -> str:
+    fieldnames = ["Date","Route No","Total Stops","Total Parcels","Payment","Internal Reference","Contract Number","Cost Centre Code"]
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=fieldnames)
+    w.writeheader()
+    for r in rows:
+        w.writerow(r)
+    return buf.getvalue()
+
+def parse_report_to_rows(text_raw: str) -> List[Dict[str, str]]:
+    text = norm(text_raw)
+    # meta first (so we can use in every line)
+    meta = extract_meta(text)
+    # week ending -> per-day dates
+    sat = parse_week_ending(text)
+    dates = compute_dates(sat)
+    # day triplets
+    triplets = extract_day_triplets(text)
+
     rows: List[Dict[str, str]] = []
-    day_re = re.compile(
-        r"(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)\s+"
-        r"Total\s+Stops:\s*(\d+)\s+"
-        r"Total\s+Parcels:\s*(\d+)\s+"
-        r"Payment:\s*([0-9]+(?:\.[0-9]{1,2})?)",
-        re.I,
-    )
-    for m in day_re.finditer(text):
-        day, stops, parcels, pay = m.groups()
+    for d in DAYS:
+        stops, parcels, pay = triplets[d]
         rows.append({
-            "day": day.capitalize(),
-            "stops": stops,
-            "parcels": parcels,
-            "payment": f"{float(pay):.2f}",
+            "Date": dates[d].strftime("%Y-%m-%d"),
+            "Route No": meta["Route No"],
+            "Total Stops": str(stops),
+            "Total Parcels": str(parcels),
+            "Payment": pay,
+            "Internal Reference": meta["Internal Reference"],
+            "Contract Number": meta["Contract Number"],
+            "Cost Centre Code": meta["Cost Centre Code"],
         })
     return rows
 
-def date_for_day(week_ending_sat: dt.date, day: str) -> str:
-    """
-    Map Monday..Saturday to dates based on the week ending Saturday.
-    Return dd/mm/YYYY for consistency with your other CSVs.
-    """
-    offset = DAY_TO_OFFSET.get(day, 0)
-    d = week_ending_sat - dt.timedelta(days=offset)
-    return d.strftime("%d/%m/%Y")
+# ------------------------
+# API
+# ------------------------
 
-def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        return "\n".join((p.extract_text() or "") for p in pdf.pages)
+class UrlIn(BaseModel):
+    file_url: str
 
-def build_csv_stream(rows: List[Dict[str, str]], filename="weekly_summary.csv") -> StreamingResponse:
-    def gen():
-        buf = io.StringIO()
-        w = csv.DictWriter(buf, fieldnames=HEADERS)
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
-        yield buf.getvalue()
-    # Ensure correct headers for filename + CSV mime
-    return StreamingResponse(
-        gen(),
-        media_type="text/csv; charset=utf-8",
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Cache-Control": "no-store",
-        },
-    )
-
-# ---------- Endpoints ----------
 @app.get("/healthz")
 def healthz():
-    return {"status": "healthy"}
+    return {"ok": True}
+
+@app.get("/")
+def root():
+    return {"endpoints": ["/process/url", "/process/file", "/healthz"]}
 
 @app.post("/process/url")
 def process_url(body: UrlIn):
     try:
-        # Download the PDF
-        r = requests.get(body.file_url, stream=True, timeout=60)
+        r = requests.get(body.file_url, timeout=60)
         r.raise_for_status()
         pdf_bytes = r.content
-
-        text = extract_text_from_pdf(pdf_bytes)
-
-        # Header fields
-        route_no          = grab_field(text,   r"Route\s*No")
-        invoice_no        = grab_field(text,   r"Invoice\s*No")
-        internal_ref      = grab_field(text,   r"Internal\s*Reference")
-        contract_number   = grab_field(text,   r"Contract\s*Number")
-        cost_centre_code  = grab_field(text,   r"Cost\s*Centre\s*Code")
-
-        week_end = parse_week_ending(text)
-        totals = parse_totals(text)
-
-        # Build CSV rows
-        out_rows = []
-        for t in totals:
-            out_rows.append({
-                "Date": date_for_day(week_end, t["day"]),
-                "Route No": route_no,
-                "Total Stops": t["stops"],
-                "Total Parcels": t["parcels"],
-                "Payment": t["payment"],
-                "Internal Reference": internal_ref,
-                "Contract Number": contract_number,
-                "Cost Centre Code": cost_centre_code,
-            })
-
-        return build_csv_stream(out_rows, filename="weekly_summary.csv")
-
+        text = pdf_to_text(pdf_bytes)
+        rows = parse_report_to_rows(text)
+        csv_str = make_csv(rows)
+        return Response(
+            content=csv_str,
+            media_type="text/csv",
+            headers={"Content-Disposition": 'attachment; filename="weekly_summary.csv"'}
+        )
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
 
 @app.post("/process/file")
 async def process_file(file: UploadFile = File(...)):
-    """
-    Optional: upload the PDF directly (handy for local tests).
-    """
     try:
         pdf_bytes = await file.read()
-        text = extract_text_from_pdf(pdf_bytes)
-
-        route_no          = grab_field(text,   r"Route\s*No")
-        invoice_no        = grab_field(text,   r"Invoice\s*No")
-        internal_ref      = grab_field(text,   r"Internal\s*Reference")
-        contract_number   = grab_field(text,   r"Contract\s*Number")
-        cost_centre_code  = grab_field(text,   r"Cost\s*Centre\s*Code")
-
-        week_end = parse_week_ending(text)
-        totals = parse_totals(text)
-
-        out_rows = []
-        for t in totals:
-            out_rows.append({
-                "Date": date_for_day(week_end, t["day"]),
-                "Route No": route_no,
-                "Total Stops": t["stops"],
-                "Total Parcels": t["parcels"],
-                "Payment": t["payment"],
-                "Internal Reference": internal_ref,
-                "Contract Number": contract_number,
-                "Cost Centre Code": cost_centre_code,
-            })
-
-        safe_name = (file.filename or "weekly").rsplit(".", 1)[0] + ".csv"
-        return build_csv_stream(out_rows, filename=safe_name)
-
+        text = pdf_to_text(pdf_bytes)
+        rows = parse_report_to_rows(text)
+        csv_str = make_csv(rows)
+        return Response(
+            content=csv_str,
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{(file.filename or "weekly")}.csv"'}
+        )
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
