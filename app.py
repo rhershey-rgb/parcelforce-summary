@@ -45,26 +45,39 @@ def grab_header(text: str) -> Dict[str,str]:
         "cost":    find(r"Cost\s*Centre\s*Code\s*:\s*([0-9]+)")
     }
 
-def grab_day_totals(text: str, day: str) -> Tuple[str,str,str]:
+def grab_day_totals(text: str, day: str) -> Tuple[str, str, str]:
     """
-    Look inside the block that begins with e.g. 'Monday' up to the next day name,
-    and read the last 'Total  <stops>  <parcels>  £<payment>' inside it.
+    Robust: find the first 'Total <stops> <parcels> £<payment>' that occurs
+    *after* the given day label, allowing column-order jumps. Limit the search
+    window to avoid accidentally crossing into a different section.
     """
-    # Slice text from this day to (next day|Totals|end)
-    next_labels = DAY_NAMES[DAY_NAMES.index(day)+1:] + ["Totals"]
-    next_pat = r"|".join([re.escape(lbl) for lbl in next_labels])
-    mblk = re.search(
-        rf"{re.escape(day)}\b(.*?)\b(?:{next_pat})",
-        text, flags=re.S|re.I
-    )
-    block = mblk.group(1) if mblk else ""
+    # where does the day label start?
+    mstart = re.search(rf"\b{re.escape(day)}\b", text, flags=re.I)
+    if not mstart:
+        return ("0", "0", "0.00")
+    start = mstart.start()
 
-    # Total line inside the block
-    m = re.search(r"Total\s+(\d+)\s+(\d+)\s+£?\s*([\d\.,]+)", block, flags=re.I)
-    if not m:
-        return ("0","0","0.00")
-    stops, parcels, pay = m.groups()
-    return (stops.strip(), parcels.strip(), money(pay))
+    # Search window: from the day label forward N characters
+    # (2000–3000 chars is usually plenty for one day panel)
+    window = text[start:start + 3000]
+
+    # Prefer the LAST Total in the window (in case there are small sub-totals above)
+    mtotals = list(re.finditer(r"Total\s+(\d+)\s+(\d+)\s+£?\s*([\d\.,]+)",
+                               window, flags=re.I))
+    if mtotals:
+        m = mtotals[-1]
+        stops, parcels, pay = m.group(1), m.group(2), m.group(3)
+        return (stops.strip(), parcels.strip(), money(pay))
+
+    # Fallback: scan from day label to end of page (just in case window was too small)
+    m = re.search(r"Total\s+(\d+)\s+(\d+)\s+£?\s*([\d\.,]+)",
+                  text[start:], flags=re.I)
+    if m:
+        stops, parcels, pay = m.group(1), m.group(2), m.group(3)
+        return (stops.strip(), parcels.strip(), money(pay))
+
+    return ("0", "0", "0.00")
+
 
 def extract_first_pages(pdf_bytes: bytes) -> List[Dict[str,str]]:
     rows: List[Dict[str,str]] = []
