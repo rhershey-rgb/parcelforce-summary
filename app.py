@@ -2,7 +2,7 @@ import io
 import re
 import csv
 import datetime as dt
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, List
 
 import pdfplumber
 import requests
@@ -12,18 +12,23 @@ from pydantic import BaseModel
 
 app = FastAPI(title="PF Weekly Summary (All Days + Cost Centre Code)")
 
-# -------------------- small helpers --------------------
+DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
 
-def _clean(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip())
+# -------------------- helpers --------------------
 
 def _page1_text(pdf_bytes: bytes) -> str:
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        first = pdf.pages[0]
-        # use layout extraction to keep ordering a bit better
-        txt = first.extract_text(layout=True) or first.extract_text() or ""
-    # normalize whitespace so regex across lines works
-    return re.sub(r"[ \t]+", " ", txt).replace("\n", " ")
+        p0 = pdf.pages[0]
+        txt = p0.extract_text(layout=True) or p0.extract_text() or ""
+    # flatten whitespace and join lines
+    txt = txt.replace("\n", " ")
+    txt = re.sub(r"[ \t]+", " ", txt)
+
+    # CRITICAL: collapse spaces between digits (PDF kerning issue)
+    #  "2 8 1 . 9 3" -> "281.93"
+    txt = re.sub(r"(?<=\d)\s+(?=\d)", "", txt)          # 1 2 3 -> 123
+    txt = re.sub(r"(?<=\d)\s*\.\s*(?=\d)", ".", txt)    # 123 . 45 -> 123.45
+    return txt
 
 def _fmt_money(x: str) -> str:
     s = (x or "").replace(",", "").replace("£", "").strip()
@@ -32,79 +37,45 @@ def _fmt_money(x: str) -> str:
     try:
         return f"{float(s):.2f}"
     except Exception:
-        # last resort: strip non-numeric, keep dot
         s2 = re.sub(r"[^0-9.]", "", s)
         return f"{float(s2 or 0):.2f}"
 
 def _only_digits(s: str) -> str:
     return re.sub(r"\D+", "", s or "")
 
-# -------------------- parsing of page 1 --------------------
+# -------------------- meta parsing --------------------
 
-DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+def parse_meta(text: str) -> Dict[str, str]:
+    meta: Dict[str, str] = {}
 
-def parse_summary_page1(text: str) -> Dict[str, Dict[str, str]]:
-    """
-    Returns a dict:
-      meta: Route No, Invoice No, WeekEnding (ISO), CostCentre
-      days: {day: {"stops":.., "parcels":.., "payment":..}}
-    """
-    out = {"meta": {}, "days": {}}
-
-    # Route number (ensure we hit the actual label)
     m = re.search(r"Route\s*No\.?\s*[:.]?\s*([A-Za-z0-9\-_/]+)", text, re.I)
     if m:
-        out["meta"]["route"] = m.group(1).strip()
+        meta["route"] = m.group(1).strip()
 
-    # Invoice number (accept an optional asterisk after "No")
     m = re.search(r"Invoice\s*No\.?\*?\s*[:.]?\s*([A-Za-z0-9\-_/]+)", text, re.I)
     if m:
-        out["meta"]["invoice"] = m.group(1).strip()
+        meta["invoice"] = m.group(1).strip()
 
-    # Cost Centre Code (digits)
     m = re.search(r"Cost\s*Centre\s*Code\s*[:.]?\s*([A-Za-z0-9]+)", text, re.I)
     if m:
-        out["meta"]["cost_centre"] = _only_digits(m.group(1))
+        meta["cost_centre"] = _only_digits(m.group(1))
 
-    # Week ending Saturday dd.mm.yy / dd-mm-yy / dd/mm/yy
     m = re.search(
         r"Week\s*ending\s*Saturday\s*[:.]?\s*(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})",
         text, re.I,
     )
     if m:
         raw = m.group(1)
-        # unify separators
         d, mth, y = re.split(r"[./-]", raw)
         d, mth, y = int(d), int(mth), int(y)
-        if y < 100:  # 25 -> 2025 (assume 2000s)
+        if y < 100:
             y += 2000
-        sat = dt.date(y, mth, d)
-        out["meta"]["week_ending_iso"] = sat.isoformat()
-    # If not found, meta will simply miss it (we’ll error later).
+        meta["week_ending_iso"] = dt.date(y, mth, d).isoformat()
 
-    # Day blocks: "<Day> ... Total Stops: X ... Total Parcels: Y ... Payment: Z"
-    # Make it tolerant about spaces and punctuation.
-    for day in DAY_NAMES:
-        pat = (
-            rf"{day}\b.*?"
-            r"Total\s*Stops\s*[:.]?\s*(\d+)\D+?"
-            r"Total\s*Parcels\s*[:.]?\s*(\d+)\D+?"
-            r"Payment\s*[:.]?\s*£?\s*([0-9]+(?:\.[0-9]{{1,2}})?)"
-        )
-        m = re.search(pat, text, re.I | re.S)
-        if m:
-            stops, parcels, pay = m.groups()
-            out["days"][day] = {
-                "stops": str(int(stops)),               # remove leading zeros
-                "parcels": str(int(parcels)),
-                "payment": _fmt_money(pay),
-            }
-
-    return out
+    return meta
 
 def dates_from_weekending(iso_saturday: str) -> Dict[str, str]:
     sat = dt.date.fromisoformat(iso_saturday)
-    # map Mon..Sat to actual dates
     return {
         "Monday":    (sat - dt.timedelta(days=5)).isoformat(),
         "Tuesday":   (sat - dt.timedelta(days=4)).isoformat(),
@@ -114,7 +85,66 @@ def dates_from_weekending(iso_saturday: str) -> Dict[str, str]:
         "Saturday":  sat.isoformat(),
     }
 
-# -------------------- CSV building --------------------
+# -------------------- day blocks --------------------
+
+def _segment_for_day(text: str, day: str) -> str:
+    # find this day's start
+    m = re.search(rf"\b{day}\b", text, re.I)
+    if not m:
+        return ""
+    start = m.end()
+
+    # find the nearest next day label
+    next_pos = len(text)
+    for other in DAY_NAMES:
+        if other == day:
+            continue
+        mm = re.search(rf"\b{other}\b", text[start:], re.I)
+        if mm:
+            pos = start + mm.start()
+            if pos < next_pos:
+                next_pos = pos
+    return text[start:next_pos]
+
+def extract_day_numbers(segment: str) -> Dict[str, str]:
+    # Very tolerant patterns: “Total Stops” or “Stops”, punctuation optional
+    pat = (
+        r"(?:Total\s*)?Stops\s*[:.]?\s*(\d+).*?"
+        r"(?:Total\s*)?Parcels\s*[:.]?\s*(\d+).*?"
+        r"Payment\s*[:.]?\s*£?\s*([0-9]+(?:\.[0-9]{1,2})?)"
+    )
+    m = re.search(pat, segment, re.I | re.S)
+    if m:
+        stops, parcels, pay = m.groups()
+        return {
+            "stops": str(int(stops)),
+            "parcels": str(int(parcels)),
+            "payment": _fmt_money(pay),
+        }
+
+    # Fallback: find each metric separately inside the segment
+    def grab(label_pat: str, money: bool = False, default: str = "0") -> str:
+        mm = re.search(label_pat, segment, re.I)
+        if not mm:
+            return "0.00" if money else default
+        val = mm.group(1)
+        return _fmt_money(val) if money else str(int(val))
+
+    stops = grab(r"(?:Total\s*)?Stops\s*[:.]?\s*(\d+)")
+    parcels = grab(r"(?:Total\s*)?Parcels\s*[:.]?\s*(\d+)")
+    payment = grab(r"Payment\s*[:.]?\s*£?\s*([0-9]+(?:\.[0-9]{1,2})?)", money=True)
+    return {"stops": stops, "parcels": parcels, "payment": payment}
+
+def parse_days(text: str) -> Dict[str, Dict[str, str]]:
+    out: Dict[str, Dict[str, str]] = {}
+    for day in DAY_NAMES:
+        seg = _segment_for_day(text, day)
+        if not seg:
+            continue
+        out[day] = extract_day_numbers(seg)
+    return out
+
+# -------------------- CSV rows --------------------
 
 CSV_COLUMNS = [
     "Day", "Date", "Stops", "Parcels", "Payment",
@@ -123,36 +153,30 @@ CSV_COLUMNS = [
 
 def build_rows(pdf_bytes: bytes) -> List[Dict[str, str]]:
     text = _page1_text(pdf_bytes)
-    parsed = parse_summary_page1(text)
+    meta = parse_meta(text)
 
-    # Validate must-have fields
     missing = []
-    if not parsed["meta"].get("week_ending_iso"):
-        missing.append("Week ending Saturday")
-    if not parsed["meta"].get("route"):
-        missing.append("Route No.")
-    if not parsed["meta"].get("invoice"):
-        missing.append("Invoice No.")
+    if "week_ending_iso" not in meta: missing.append("Week ending Saturday")
+    if "route" not in meta:           missing.append("Route No.")
+    if "invoice" not in meta:         missing.append("Invoice No.")
     if missing:
         raise ValueError(f"Missing required field(s): {', '.join(missing)}")
 
-    dates = dates_from_weekending(parsed["meta"]["week_ending_iso"])
-    route = parsed["meta"].get("route", "")
-    invoice = parsed["meta"].get("invoice", "")
-    cost_centre = parsed["meta"].get("cost_centre", "")
+    dates = dates_from_weekending(meta["week_ending_iso"])
+    days = parse_days(text)
 
     rows: List[Dict[str, str]] = []
     for day in DAY_NAMES:
-        day_data = parsed["days"].get(day, {"stops": "0", "parcels": "0", "payment": "0.00"})
+        d = days.get(day, {"stops": "0", "parcels": "0", "payment": "0.00"})
         rows.append({
             "Day": day,
             "Date": dates[day],
-            "Stops": day_data["stops"],
-            "Parcels": day_data["parcels"],
-            "Payment": day_data["payment"],
-            "Invoice Number": invoice,
-            "Route Number": route,
-            "Cost Centre Code": cost_centre,
+            "Stops": d["stops"],
+            "Parcels": d["parcels"],
+            "Payment": d["payment"],
+            "Invoice Number": meta.get("invoice", ""),
+            "Route Number": meta.get("route", ""),
+            "Cost Centre Code": meta.get("cost_centre", ""),
         })
     return rows
 
@@ -194,5 +218,3 @@ async def process_file(file: UploadFile = File(...)):
         return stream_csv(pdf_bytes, "weekly_summary.csv")
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
-
-
